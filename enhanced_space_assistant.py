@@ -13,7 +13,22 @@ import openai
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
-from query_optimizer import SpaceScienceQueryOptimizer
+
+# Try to import query optimizer, make it optional
+try:
+    from query_optimizer import SpaceScienceQueryOptimizer
+    QUERY_OPTIMIZER_AVAILABLE = True
+except ImportError:
+    print("⚠️  query_optimizer not found, using basic query processing")
+    QUERY_OPTIMIZER_AVAILABLE = False
+    class SpaceScienceQueryOptimizer:
+        """Fallback query optimizer when query_optimizer.py is not available."""
+        def optimize_query(self, query: str) -> Dict[str, Any]:
+            return {
+                'optimized_query': query,
+                'original_query': query,
+                'detected_topics': []
+            }
 
 class EnhancedSpaceScienceAssistant:
     """Enhanced RAG Assistant with GPT-4 integration for space science queries."""
@@ -92,7 +107,8 @@ class EnhancedSpaceScienceAssistant:
                 data = json.load(f)
                 return data.get('knowledge_base', {}).get('chunks', [])
         except FileNotFoundError:
-            print(f"❌ Knowledge base file not found: {file_path}")
+            print(f"⚠️  Knowledge base file not found: {file_path}")
+            print(f"   Creating empty knowledge base. You can add content later.")
             return []
         except Exception as e:
             print(f"❌ Error loading knowledge base: {e}")
@@ -111,7 +127,10 @@ class EnhancedSpaceScienceAssistant:
                 name=self.collection_name,
                 metadata={"description": "Enhanced Space Science Knowledge Base with GPT-4"}
             )
-            self._populate_vector_db()
+            if self.knowledge_base:
+                self._populate_vector_db()
+            else:
+                print("⚠️  No knowledge base loaded. Collection created but empty.")
     
     def _populate_vector_db(self):
         """Populate ChromaDB with knowledge chunks."""
@@ -178,13 +197,18 @@ class EnhancedSpaceScienceAssistant:
     def retrieve_knowledge(self, query: str, n_results: int = 5) -> List[Dict]:
         """Retrieve relevant knowledge chunks using semantic search."""
         try:
+            # Check if collection has any documents
+            if self.collection.count() == 0:
+                print("⚠️  Knowledge base is empty")
+                return []
+            
             # Generate query embedding
             query_embedding = self.embedding_model.encode([query])[0].tolist()
             
             # Search in ChromaDB
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=n_results
+                n_results=min(n_results, self.collection.count())
             )
             
             # Format results
@@ -205,22 +229,24 @@ class EnhancedSpaceScienceAssistant:
     
     def generate_gpt4_response(self, question: str, context_chunks: List[Dict]) -> Dict[str, Any]:
         """Generate response using GPT-4 with retrieved context."""
+        
+        # Fallback if no OpenAI client
         if not self.openai_client:
             return self._generate_basic_response(question, context_chunks)
         
         try:
-            # Prepare context from retrieved chunks
-            context_text = "\n\n".join([
-                f"Source {i+1} ({chunk['metadata'].get('topic', 'Unknown')}):\n{chunk['text']}"
-                for i, chunk in enumerate(context_chunks[:3])
-            ])
+            # Build context from chunks
+            context_text = ""
+            for i, chunk in enumerate(context_chunks, 1):
+                context_text += f"\n--- Source {i} ---\n"
+                context_text += f"Topic: {chunk['metadata'].get('topic', 'Unknown')}\n"
+                context_text += f"Content: {chunk['text']}\n"
             
             # Create system prompt
-            system_prompt = """
-You are an expert space science assistant. Use the provided context to answer questions accurately and comprehensively.
+            system_prompt = """You are an expert space science educator with deep knowledge of astronomy, 
+astrophysics, planetary science, and space exploration. Your responses should be:
 
-Guidelines:
-1. Base your answers primarily on the provided context
+1. Based primarily on the provided context sources
 2. If the context doesn't fully answer the question, acknowledge this
 3. Provide specific details and examples when available
 4. Maintain scientific accuracy
@@ -267,7 +293,7 @@ Please provide a comprehensive answer based on the context above.
             return {
                 'response': gpt_response,
                 'sources': sources,
-                'topics_covered': topics_covered,
+                'topics': topics_covered,
                 'model_used': 'GPT-4',
                 'chunks_used': len(context_chunks)
             }
@@ -282,7 +308,7 @@ Please provide a comprehensive answer based on the context above.
             return {
                 'response': "I don't have enough information to answer that question. Please try rephrasing or asking about a different space science topic.",
                 'sources': [],
-                'topics_covered': [],
+                'topics': [],
                 'model_used': 'Basic',
                 'chunks_used': 0
             }
@@ -308,7 +334,7 @@ Please provide a comprehensive answer based on the context above.
         return {
             'response': response,
             'sources': sources,
-            'topics_covered': list(topics_covered),
+            'topics': list(topics_covered),
             'model_used': 'Basic',
             'chunks_used': len(context_chunks)
         }
@@ -349,6 +375,9 @@ Please provide a comprehensive answer based on the context above.
     def get_available_topics(self) -> List[str]:
         """Get list of available topics."""
         try:
+            if self.collection.count() == 0:
+                return []
+                
             results = self.collection.get()
             topics = set()
             for metadata in results['metadatas']:
@@ -387,38 +416,3 @@ Please provide a comprehensive answer based on the context above.
     def clear_conversation_history(self):
         """Clear conversation history."""
         self.conversation_history = []
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Initialize enhanced assistant
-    assistant = EnhancedSpaceScienceAssistant()
-    
-    # Test questions
-    test_questions = [
-        "What did the Perseverance rover discover on Mars?",
-        "How do black holes form and what happens at their event horizon?",
-        "Tell me about the James Webb Space Telescope's recent discoveries",
-        "What is the composition of Mars' atmosphere and how does it compare to Earth?",
-        "Explain gravitational waves and their detection by LIGO"
-    ]
-    
-    print("\n" + "="*60)
-    print("🚀 ENHANCED SPACE SCIENCE ASSISTANT - GPT-4 POWERED")
-    print("="*60)
-    
-    for i, question in enumerate(test_questions, 1):
-        print(f"\n{i}. Query: {question}")
-        print("-" * 40)
-        
-        response_data = assistant.ask(question)
-        
-        print(f"Model: {response_data['model_used']}")
-        print(f"Response: {response_data['response'][:200]}...")
-        print(f"Topics: {', '.join(response_data['topics_covered'])}")
-        print(f"Sources: {len(response_data['sources'])}")
-        if response_data['sources']:
-            print(f"Top source: {response_data['sources'][0]['topic']} - {response_data['sources'][0]['subtopic']}")
-    
-    print("\n" + "="*60)
-    print("Enhanced Assistant initialized successfully!")
-    print("Use assistant.ask('your question') to interact with GPT-4 powered responses.")
