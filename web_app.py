@@ -1,11 +1,14 @@
-from flask import Flask, render_template, request, jsonify
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 import os
 import sys
-import io
-import wave
 import time
 from threading import Lock
 from enhanced_space_assistant import EnhancedSpaceScienceAssistant
+import base64
 
 # Import voice functionality
 try:
@@ -16,7 +19,11 @@ except ImportError:
     VOICE_ENABLED = False
     print("⚠️  Voice libraries not available. Install with: pip install openai elevenlabs")
 
-app = Flask(__name__)
+app = FastAPI(title="Space Science Assistant API")
+
+# Mount static files and templates
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
 # Rate limiting for TTS requests
 tts_lock = Lock()
@@ -25,6 +32,13 @@ TTS_COOLDOWN = 2  # seconds between requests per session
 
 # Initialize the space assistant
 space_assistant = None
+
+# Pydantic models for request validation
+class QuestionRequest(BaseModel):
+    question: str
+
+class TextToSpeechRequest(BaseModel):
+    text: str
 
 def initialize_assistant():
     global space_assistant
@@ -37,119 +51,130 @@ def initialize_assistant():
         print(f"Error initializing assistant: {e}")
         return False
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the assistant on startup."""
+    if not initialize_assistant():
+        print("❌ Failed to initialize the assistant. Please check your configuration.")
 
-@app.route('/ask', methods=['POST'])
-def ask_question():
+@app.get("/")
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
     try:
-        data = request.get_json()
-        question = data.get('question', '').strip()
+        question = request.question.strip()
         
         if not question:
-            return jsonify({'error': 'Please provide a question'}), 400
+            raise HTTPException(status_code=400, detail="Please provide a question")
         
         if not space_assistant:
-            return jsonify({'error': 'Assistant not initialized'}), 500
+            raise HTTPException(status_code=500, detail="Assistant not initialized")
         
         # Get response from the assistant
         response = space_assistant.ask_question(question)
         
-        return jsonify({
+        return {
             'response': response.get('response', ''),
             'sources': response.get('sources', []),
             'topics': response.get('topics', [])
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.route('/topics')
-def get_topics():
+@app.get("/topics")
+async def get_topics():
     try:
         if not space_assistant:
-            return jsonify({'error': 'Assistant not initialized'}), 500
+            raise HTTPException(status_code=500, detail="Assistant not initialized")
         
         topics = space_assistant.get_available_topics()
-        return jsonify({'topics': topics})
+        return {'topics': topics}
         
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.route('/speech_to_text', methods=['POST'])
-def speech_to_text():
+@app.post("/speech_to_text")
+async def speech_to_text(request: Request, audio: UploadFile = File(...)):
     """Convert uploaded audio to text using OpenAI Whisper."""
     try:
         if not VOICE_ENABLED:
-            return jsonify({'error': 'Voice features not available'}), 400
+            raise HTTPException(status_code=400, detail="Voice features not available")
         
-        if 'audio' not in request.files:
-            return jsonify({'error': 'No audio file provided'}), 400
-        
-        audio_file = request.files['audio']
-        if audio_file.filename == '':
-            return jsonify({'error': 'No audio file selected'}), 400
+        if not audio.filename:
+            raise HTTPException(status_code=400, detail="No audio file selected")
         
         # Use OpenAI Whisper for speech-to-text
         openai_key = os.getenv('OPENAI_API_KEY')
         if not openai_key:
-            return jsonify({'error': 'OpenAI API key not configured'}), 400
+            raise HTTPException(status_code=400, detail="OpenAI API key not configured")
             
         client = openai.OpenAI(api_key=openai_key)
         
-        # Convert FileStorage to a file-like object that OpenAI can handle
-        audio_file.seek(0)  # Reset file pointer to beginning
+        # Read audio file content
+        audio_content = await audio.read()
+        
+        # Convert to format OpenAI can handle
         transcript = client.audio.transcriptions.create(
             model="whisper-1",
-            file=(audio_file.filename or "audio.wav", audio_file.read(), "audio/wav"),
+            file=(audio.filename or "audio.wav", audio_content, "audio/wav"),
             language="en"
         )
         
-        return jsonify({
+        return {
             'text': transcript.text.strip(),
             'success': True
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Speech-to-text error: {str(e)}")
         print(f"Error type: {type(e).__name__}")
         import traceback
         traceback.print_exc()
-        return jsonify({'error': f'Speech-to-text error: {str(e)}'}), 500
+        raise HTTPException(status_code=500, detail=f"Speech-to-text error: {str(e)}")
 
-@app.route('/text_to_speech', methods=['POST'])
-def text_to_speech():
+@app.post("/text_to_speech")
+async def text_to_speech(request: Request, tts_request: TextToSpeechRequest):
     """Convert text to speech using ElevenLabs."""
     try:
         if not VOICE_ENABLED:
-            return jsonify({'error': 'Voice features not available'}), 400
+            raise HTTPException(status_code=400, detail="Voice features not available")
         
         # Simple rate limiting based on IP
-        client_ip = request.remote_addr
+        client_ip = request.client.host
         current_time = time.time()
         
         with tts_lock:
             if client_ip in tts_last_request:
                 time_since_last = current_time - tts_last_request[client_ip]
                 if time_since_last < TTS_COOLDOWN:
-                    return jsonify({
-                        'error': f'Please wait {TTS_COOLDOWN - time_since_last:.1f} seconds before making another request.',
-                        'rate_limited': True
-                    }), 429
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            'error': f'Please wait {TTS_COOLDOWN - time_since_last:.1f} seconds before making another request.',
+                            'rate_limited': True
+                        }
+                    )
             
             tts_last_request[client_ip] = current_time
         
-        data = request.get_json()
-        text = data.get('text', '').strip()
+        text = tts_request.text.strip()
         
         if not text:
-            return jsonify({'error': 'No text provided'}), 400
+            raise HTTPException(status_code=400, detail="No text provided")
         
         # Setup ElevenLabs API key
         elevenlabs_key = os.getenv('ELEVENLABS_API_KEY')
         if not elevenlabs_key:
-            return jsonify({'error': 'ElevenLabs API key not configured'}), 400
+            raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
         
         # Initialize ElevenLabs client
         client = ElevenLabs(api_key=elevenlabs_key)
@@ -163,79 +188,86 @@ def text_to_speech():
         )
         
         # Convert audio to base64 for web transmission
-        import base64
         # ElevenLabs returns an iterator of audio chunks
         audio_bytes = b''.join(audio)
         audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
         
-        return jsonify({
+        return {
             'audio': audio_base64,
             'success': True
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         # Handle ElevenLabs rate limiting
         if '429' in error_msg or 'too_many_concurrent_requests' in error_msg:
-            return jsonify({
-                'error': 'ElevenLabs rate limit exceeded. Please wait a moment and try again.',
-                'rate_limited': True
-            }), 429
-        return jsonify({'error': f'Text-to-speech error: {error_msg}'}), 500
+            return JSONResponse(
+                status_code=429,
+                content={
+                    'error': 'ElevenLabs rate limit exceeded. Please wait a moment and try again.',
+                    'rate_limited': True
+                }
+            )
+        raise HTTPException(status_code=500, detail=f"Text-to-speech error: {error_msg}")
 
-@app.route('/voice_status')
-def voice_status():
+@app.get("/voice_status")
+async def voice_status():
     """Check if voice features are available."""
-    return jsonify({
+    return {
         'voice_enabled': VOICE_ENABLED,
         'openai_key': bool(os.getenv('OPENAI_API_KEY')),
         'elevenlabs_key': bool(os.getenv('ELEVENLABS_API_KEY'))
-    })
+    }
 
-@app.route('/history')
-def get_history():
+@app.get("/history")
+async def get_history():
     try:
         if not space_assistant:
-            return jsonify({'error': 'Assistant not initialized'}), 500
+            raise HTTPException(status_code=500, detail="Assistant not initialized")
         
         history = space_assistant.get_conversation_history()
-        return jsonify({'history': history})
+        return {'history': history}
         
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.route('/clear_history', methods=['POST'])
-def clear_history():
+@app.post("/clear_history")
+async def clear_history():
     try:
         if not space_assistant:
-            return jsonify({'error': 'Assistant not initialized'}), 500
+            raise HTTPException(status_code=500, detail="Assistant not initialized")
         
         space_assistant.clear_conversation_history()
-        return jsonify({'message': 'Conversation history cleared'})
+        return {'message': 'Conversation history cleared'}
         
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.route('/rebuild_knowledge', methods=['POST'])
-def rebuild_knowledge():
+@app.post("/rebuild_knowledge")
+async def rebuild_knowledge():
     """Rebuild the knowledge base with updated information."""
     try:
         if not space_assistant:
-            return jsonify({'error': 'Assistant not initialized'}), 500
+            raise HTTPException(status_code=500, detail="Assistant not initialized")
         
         space_assistant.rebuild_knowledge_base()
-        return jsonify({'success': True, 'message': 'Knowledge base rebuilt successfully'})
+        return {'success': True, 'message': 'Knowledge base rebuilt successfully'}
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == '__main__':
-    print("Starting Space Science Assistant Web Interface...")
+    import uvicorn
     
-    if initialize_assistant():
-        print("\n🚀 Space Science Assistant Web UI is ready!")
-        print("🌟 Open your browser and navigate to: http://localhost:5000")
-        print("🌙 Explore the cosmos with our AI assistant!\n")
-        port = int(os.environ.get("PORT", 10000))  # ✅ CORRECT
-        app.run(host="0.0.0.0", port=port)
-    else:
-        print("❌ Failed to initialize the assistant. Please check your configuration.")
-        sys.exit(1)
+    print("Starting Space Science Assistant Web Interface...")
+    print("\n🚀 Space Science Assistant Web UI is ready!")
+    print("🌟 Open your browser and navigate to: http://localhost:5000")
+    print("🌙 Explore the cosmos with our AI assistant!\n")
+    
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
