@@ -4,10 +4,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import os
-import sys
 import time
 from threading import Lock
-from enhanced_space_assistant import EnhancedSpaceScienceAssistant
 import base64
 import logging
 
@@ -18,7 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import voice functionality
+# Try to import voice functionality
 try:
     import openai
     from elevenlabs.client import ElevenLabs
@@ -27,7 +25,18 @@ try:
 except ImportError as e:
     VOICE_ENABLED = False
     logger.warning(f"⚠️  Voice libraries not available: {e}")
-    logger.warning("Install with: pip install openai elevenlabs")
+
+# Try to import assistant - MAKE IT COMPLETELY OPTIONAL
+space_assistant = None
+ASSISTANT_AVAILABLE = False
+
+try:
+    from enhanced_space_assistant import EnhancedSpaceScienceAssistant
+    ASSISTANT_AVAILABLE = True
+    logger.info("✅ Assistant module found")
+except ImportError as e:
+    logger.warning(f"⚠️  Assistant module not available: {e}")
+    logger.warning("   App will run in limited mode without AI assistant")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -36,7 +45,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Mount static files and templates
+# Mount static files and templates (optional)
 try:
     app.mount("/static", StaticFiles(directory="static"), name="static")
     templates = Jinja2Templates(directory="templates")
@@ -48,12 +57,9 @@ except Exception as e:
 # Rate limiting for TTS requests
 tts_lock = Lock()
 tts_last_request = {}
-TTS_COOLDOWN = 2  # seconds between requests per session
+TTS_COOLDOWN = 2
 
-# Initialize the space assistant
-space_assistant = None
-
-# Pydantic models for request validation
+# Pydantic models
 class QuestionRequest(BaseModel):
     question: str
 
@@ -63,16 +69,26 @@ class TextToSpeechRequest(BaseModel):
 def initialize_assistant():
     """Initialize the space science assistant."""
     global space_assistant
+    
+    if not ASSISTANT_AVAILABLE:
+        logger.warning("⚠️  Assistant module not available, skipping initialization")
+        return False
+    
     try:
         logger.info("🚀 Initializing Space Science Assistant...")
         space_assistant = EnhancedSpaceScienceAssistant()
-        space_assistant.initialize()
+        
+        # Try to initialize
+        if hasattr(space_assistant, 'initialize'):
+            space_assistant.initialize()
+        
         logger.info("✅ Space Science Assistant initialized successfully!")
         return True
     except Exception as e:
         logger.error(f"❌ Error initializing assistant: {e}")
         import traceback
         traceback.print_exc()
+        space_assistant = None
         return False
 
 @app.on_event("startup")
@@ -97,11 +113,15 @@ async def startup_event():
     else:
         logger.warning("⚠️  ElevenLabs API key not set")
     
-    # Initialize assistant
-    if not initialize_assistant():
-        logger.error("❌ Failed to initialize the assistant. Please check your configuration.")
-        logger.warning("⚠️  Service will continue but assistant features may not work.")
+    # Initialize assistant (optional)
+    if ASSISTANT_AVAILABLE:
+        if not initialize_assistant():
+            logger.warning("⚠️  Assistant initialization failed. Service will continue without AI features.")
+    else:
+        logger.warning("⚠️  Assistant module not available. Service will run in limited mode.")
     
+    logger.info("=" * 60)
+    logger.info("✅ Service startup complete!")
     logger.info("=" * 60)
 
 @app.get("/")
@@ -114,12 +134,14 @@ async def index(request: Request):
             content={
                 "message": "Space Science Assistant API is running",
                 "status": "healthy",
+                "assistant_available": ASSISTANT_AVAILABLE,
+                "assistant_initialized": space_assistant is not None,
                 "endpoints": {
+                    "health": "/health",
                     "ask": "/ask",
                     "topics": "/topics",
                     "history": "/history",
-                    "voice_status": "/voice_status",
-                    "health": "/health"
+                    "voice_status": "/voice_status"
                 }
             }
         )
@@ -129,9 +151,11 @@ async def health_check():
     """Health check endpoint for monitoring."""
     return {
         "status": "healthy",
+        "assistant_available": ASSISTANT_AVAILABLE,
         "assistant_initialized": space_assistant is not None,
         "voice_enabled": VOICE_ENABLED,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "port": os.getenv('PORT', '10000')
     }
 
 @app.post("/ask")
@@ -144,10 +168,13 @@ async def ask_question(request: QuestionRequest):
             raise HTTPException(status_code=400, detail="Please provide a question")
         
         if not space_assistant:
-            raise HTTPException(
-                status_code=503, 
-                detail="Assistant not initialized. Please try again in a moment."
-            )
+            # Return a friendly message instead of error
+            return {
+                'response': f"I received your question: '{question}'. However, the AI assistant is not currently initialized. Please check the server logs or try again later.",
+                'sources': [],
+                'topics': [],
+                'status': 'assistant_not_available'
+            }
         
         logger.info(f"📝 Question received: {question[:100]}...")
         
@@ -159,33 +186,34 @@ async def ask_question(request: QuestionRequest):
         return {
             'response': response.get('response', ''),
             'sources': response.get('sources', []),
-            'topics': response.get('topics', [])
+            'topics': response.get('topics', []),
+            'status': 'success'
         }
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Error processing question: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        return {
+            'response': f"An error occurred while processing your question. Error: {str(e)}",
+            'sources': [],
+            'topics': [],
+            'status': 'error'
+        }
 
 @app.get("/topics")
 async def get_topics():
     """Get available topics from the assistant."""
     try:
         if not space_assistant:
-            raise HTTPException(
-                status_code=503, 
-                detail="Assistant not initialized"
-            )
+            return {'topics': [], 'message': 'Assistant not initialized'}
         
         topics = space_assistant.get_available_topics()
         return {'topics': topics}
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"❌ Error fetching topics: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        return {'topics': [], 'error': str(e)}
 
 @app.post("/speech_to_text")
 async def speech_to_text(request: Request, audio: UploadFile = File(...)):
@@ -200,30 +228,25 @@ async def speech_to_text(request: Request, audio: UploadFile = File(...)):
         if not audio.filename:
             raise HTTPException(status_code=400, detail="No audio file selected")
         
-        # Use OpenAI Whisper for speech-to-text
         openai_key = os.getenv('OPENAI_API_KEY')
         if not openai_key:
             raise HTTPException(
                 status_code=400, 
-                detail="OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+                detail="OpenAI API key not configured."
             )
         
         logger.info(f"🎤 Processing audio file: {audio.filename}")
         
         client = openai.OpenAI(api_key=openai_key)
-        
-        # Read audio file content
         audio_content = await audio.read()
-        logger.info(f"📊 Audio file size: {len(audio_content)} bytes")
         
-        # Convert to format OpenAI can handle
         transcript = client.audio.transcriptions.create(
             model="whisper-1",
             file=(audio.filename or "audio.wav", audio_content, "audio/wav"),
             language="en"
         )
         
-        logger.info(f"✅ Transcription successful: {transcript.text[:100]}...")
+        logger.info(f"✅ Transcription successful")
         
         return {
             'text': transcript.text.strip(),
@@ -234,8 +257,6 @@ async def speech_to_text(request: Request, audio: UploadFile = File(...)):
         raise
     except Exception as e:
         logger.error(f"❌ Speech-to-text error: {str(e)}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Speech-to-text error: {str(e)}")
 
 @app.post("/text_to_speech")
@@ -245,10 +266,9 @@ async def text_to_speech(request: Request, tts_request: TextToSpeechRequest):
         if not VOICE_ENABLED:
             raise HTTPException(
                 status_code=400, 
-                detail="Voice features not available. Please install required libraries."
+                detail="Voice features not available."
             )
         
-        # Simple rate limiting based on IP
         client_ip = request.client.host if request.client else "unknown"
         current_time = time.time()
         
@@ -260,11 +280,10 @@ async def text_to_speech(request: Request, tts_request: TextToSpeechRequest):
                     return JSONResponse(
                         status_code=429,
                         content={
-                            'error': f'Please wait {wait_time:.1f} seconds before making another request.',
+                            'error': f'Please wait {wait_time:.1f} seconds.',
                             'rate_limited': True
                         }
                     )
-            
             tts_last_request[client_ip] = current_time
         
         text = tts_request.text.strip()
@@ -273,38 +292,27 @@ async def text_to_speech(request: Request, tts_request: TextToSpeechRequest):
             raise HTTPException(status_code=400, detail="No text provided")
         
         if len(text) > 5000:
-            raise HTTPException(
-                status_code=400, 
-                detail="Text too long. Maximum 5000 characters."
-            )
+            raise HTTPException(status_code=400, detail="Text too long. Maximum 5000 characters.")
         
-        # Setup ElevenLabs API key
         elevenlabs_key = os.getenv('ELEVENLABS_API_KEY')
         if not elevenlabs_key:
-            raise HTTPException(
-                status_code=400, 
-                detail="ElevenLabs API key not configured. Please set ELEVENLABS_API_KEY environment variable."
-            )
+            raise HTTPException(status_code=400, detail="ElevenLabs API key not configured.")
         
-        logger.info(f"🔊 Generating speech for text ({len(text)} chars)...")
+        logger.info(f"🔊 Generating speech ({len(text)} chars)...")
         
-        # Initialize ElevenLabs client
         client = ElevenLabs(api_key=elevenlabs_key)
+        voice_id = "21m00Tcm4TlvDq8ikWAM"
         
-        # Generate audio using ElevenLabs
-        voice_id = "21m00Tcm4TlvDq8ikWAM"  # Default voice (Rachel)
         audio = client.text_to_speech.convert(
             voice_id=voice_id,
             text=text,
             model_id="eleven_monolingual_v1"
         )
         
-        # Convert audio to base64 for web transmission
-        # ElevenLabs returns an iterator of audio chunks
         audio_bytes = b''.join(audio)
         audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
         
-        logger.info(f"✅ Speech generated successfully ({len(audio_bytes)} bytes)")
+        logger.info(f"✅ Speech generated successfully")
         
         return {
             'audio': audio_base64,
@@ -314,32 +322,18 @@ async def text_to_speech(request: Request, tts_request: TextToSpeechRequest):
     except HTTPException:
         raise
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"❌ Text-to-speech error: {error_msg}")
-        
-        # Handle ElevenLabs rate limiting
-        if '429' in error_msg or 'too_many_concurrent_requests' in error_msg:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    'error': 'ElevenLabs rate limit exceeded. Please wait a moment and try again.',
-                    'rate_limited': True
-                }
-            )
-        raise HTTPException(status_code=500, detail=f"Text-to-speech error: {error_msg}")
+        logger.error(f"❌ Text-to-speech error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/voice_status")
 async def voice_status():
     """Check if voice features are available."""
-    openai_available = bool(os.getenv('OPENAI_API_KEY'))
-    elevenlabs_available = bool(os.getenv('ELEVENLABS_API_KEY'))
-    
     return {
         'voice_enabled': VOICE_ENABLED,
-        'openai_configured': openai_available,
-        'elevenlabs_configured': elevenlabs_available,
-        'speech_to_text_available': VOICE_ENABLED and openai_available,
-        'text_to_speech_available': VOICE_ENABLED and elevenlabs_available
+        'openai_configured': bool(os.getenv('OPENAI_API_KEY')),
+        'elevenlabs_configured': bool(os.getenv('ELEVENLABS_API_KEY')),
+        'speech_to_text_available': VOICE_ENABLED and bool(os.getenv('OPENAI_API_KEY')),
+        'text_to_speech_available': VOICE_ENABLED and bool(os.getenv('ELEVENLABS_API_KEY'))
     }
 
 @app.get("/history")
@@ -347,49 +341,36 @@ async def get_history():
     """Get conversation history."""
     try:
         if not space_assistant:
-            raise HTTPException(
-                status_code=503, 
-                detail="Assistant not initialized"
-            )
+            return {'history': [], 'message': 'Assistant not initialized'}
         
         history = space_assistant.get_conversation_history()
         return {'history': history}
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"❌ Error fetching history: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        return {'history': [], 'error': str(e)}
 
 @app.post("/clear_history")
 async def clear_history():
     """Clear conversation history."""
     try:
         if not space_assistant:
-            raise HTTPException(
-                status_code=503, 
-                detail="Assistant not initialized"
-            )
+            return {'message': 'Assistant not initialized', 'success': False}
         
         space_assistant.clear_conversation_history()
         logger.info("🗑️  Conversation history cleared")
         return {'message': 'Conversation history cleared', 'success': True}
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"❌ Error clearing history: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+        return {'message': str(e), 'success': False}
 
 @app.post("/rebuild_knowledge")
 async def rebuild_knowledge():
-    """Rebuild the knowledge base with updated information."""
+    """Rebuild the knowledge base."""
     try:
         if not space_assistant:
-            raise HTTPException(
-                status_code=503, 
-                detail="Assistant not initialized"
-            )
+            raise HTTPException(status_code=503, detail="Assistant not initialized")
         
         logger.info("🔄 Rebuilding knowledge base...")
         space_assistant.rebuild_knowledge_base()
@@ -403,7 +384,6 @@ async def rebuild_knowledge():
         logger.error(f"❌ Error rebuilding knowledge base: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Error handlers
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
     """Handle 404 errors."""
@@ -411,8 +391,7 @@ async def not_found_handler(request: Request, exc):
         status_code=404,
         content={
             "error": "Endpoint not found",
-            "path": str(request.url.path),
-            "message": "The requested resource does not exist"
+            "path": str(request.url.path)
         }
     )
 
@@ -424,17 +403,16 @@ async def internal_error_handler(request: Request, exc):
         status_code=500,
         content={
             "error": "Internal server error",
-            "message": "An unexpected error occurred. Please try again later."
+            "message": "An unexpected error occurred."
         }
     )
 
 if __name__ == '__main__':
     import uvicorn
     
-    # Get port from environment variable (Render provides this)
-    # Default to 10000 for local development
+    # CRITICAL: Get port from environment
     port = int(os.getenv('PORT', 10000))
-    host = os.getenv('HOST', '0.0.0.0')
+    host = '0.0.0.0'  # Must be 0.0.0.0 for Render
     
     # Log configuration
     print("\n" + "=" * 60)
@@ -442,13 +420,14 @@ if __name__ == '__main__':
     print("=" * 60)
     print(f"🌟 Host: {host}")
     print(f"🌟 Port: {port}")
+    print(f"🌟 PORT env: {os.getenv('PORT', 'NOT SET - using default 10000')}")
     print(f"🌙 Environment: {'Production' if os.getenv('PORT') else 'Development'}")
     print(f"🌙 Voice Enabled: {VOICE_ENABLED}")
+    print(f"🌙 Assistant Available: {ASSISTANT_AVAILABLE}")
     print("=" * 60)
-    print(f"\n✨ Server will be available at: http://{host}:{port}")
-    print("✨ Health check endpoint: http://localhost:{port}/health")
-    print("✨ API documentation: http://localhost:{port}/docs")
-    print("\n🌌 Explore the cosmos with our AI assistant!\n")
+    print(f"\n✨ Server starting on http://{host}:{port}")
+    print(f"✨ Health check: http://localhost:{port}/health")
+    print(f"✨ API docs: http://localhost:{port}/docs\n")
     
     # Run the application
     uvicorn.run(
