@@ -124,7 +124,11 @@ class SpaceScienceQueryOptimizer:
         if not user_query or user_query.strip() == "[insert user question here]":
             return {
                 "error": "Please provide a valid user question to optimize.",
-                "example": "Try asking something like: 'What did the Perseverance rover discover on Mars?' or 'How do black holes form?'"
+                "example": "Try asking something like: 'What did the Perseverance rover discover on Mars?' or 'How do black holes form?'",
+                "optimized_query": user_query,
+                "original_query": user_query,
+                "extracted_keywords": [],
+                "relevant_topics": []
             }
         
         # Extract components
