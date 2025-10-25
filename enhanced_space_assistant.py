@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Space Science RAG Assistant with GPT-4 Integration
-Combines ChromaDB retrieval with GPT-4 for advanced response generation.
+Handles all errors gracefully - won't crash the app.
 """
 
 import os
@@ -9,209 +9,225 @@ import json
 import numpy as np
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-import openai
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
 
-# Try to import query optimizer, make it optional
+# Try importing dependencies - make everything optional
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("⚠️  OpenAI not available")
+
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    print("⚠️  sentence-transformers not available")
+
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
+    print("⚠️  ChromaDB not available")
+
 try:
     from query_optimizer import SpaceScienceQueryOptimizer
     QUERY_OPTIMIZER_AVAILABLE = True
 except ImportError:
-    print("⚠️  query_optimizer not found, using basic query processing")
     QUERY_OPTIMIZER_AVAILABLE = False
+    print("⚠️  query_optimizer not available")
+    
+    # Fallback query optimizer
     class SpaceScienceQueryOptimizer:
-        """Fallback query optimizer when query_optimizer.py is not available."""
         def optimize_query(self, query: str) -> Dict[str, Any]:
             return {
                 'optimized_query': query,
                 'original_query': query,
-                'detected_topics': []
+                'extracted_keywords': [],
+                'relevant_topics': []
             }
 
 class EnhancedSpaceScienceAssistant:
-    """Enhanced RAG Assistant with GPT-4 integration for space science queries."""
+    """Enhanced RAG Assistant - works even with missing dependencies."""
     
     def __init__(self, 
                  knowledge_base_path: str = "space_science_knowledge_base.json",
                  embedding_model: str = "all-MiniLM-L6-v2",
                  openai_api_key: Optional[str] = None,
                  chroma_persist_dir: str = "./enhanced_chroma_db"):
-        """
-        Initialize the enhanced assistant.
+        """Initialize the assistant."""
+        print("Initializing Enhanced Space Science Assistant...")
         
-        Args:
-            knowledge_base_path: Path to the JSON knowledge base
-            embedding_model: SentenceTransformer model name
-            openai_api_key: OpenAI API key (or set OPENAI_API_KEY env var)
-            chroma_persist_dir: Directory for ChromaDB persistence
-        """
-        print("Initializing Enhanced Space Science Assistant with GPT-4...")
+        self.knowledge_base_path = knowledge_base_path
+        self.embedding_model_name = embedding_model
+        self.chroma_persist_dir = chroma_persist_dir
         
         # Initialize OpenAI
         self.openai_client = self._initialize_openai(openai_api_key)
         
         # Initialize components
-        self.embedding_model = SentenceTransformer(embedding_model)
-        print(f"Loading embedding model: {embedding_model}")
-        
+        self.embedding_model = None
+        self.chroma_client = None
+        self.collection = None
         self.query_optimizer = SpaceScienceQueryOptimizer()
         self.conversation_history = []
+        self.knowledge_base = []
+        
+        # Try to initialize (but don't crash if it fails)
+        try:
+            self._safe_initialize()
+        except Exception as e:
+            print(f"⚠️  Initialization warning: {e}")
+            print("   Assistant will work in limited mode")
+    
+    def _safe_initialize(self):
+        """Safely initialize components."""
+        # Load embedding model
+        if SENTENCE_TRANSFORMERS_AVAILABLE:
+            try:
+                print(f"Loading embedding model: {self.embedding_model_name}")
+                self.embedding_model = SentenceTransformer(self.embedding_model_name)
+                print("✅ Embedding model loaded")
+            except Exception as e:
+                print(f"⚠️  Could not load embedding model: {e}")
         
         # Initialize ChromaDB
-        print("Setting up Enhanced ChromaDB...")
-        self.chroma_client = chromadb.PersistentClient(
-            path=chroma_persist_dir,
-            settings=Settings(anonymized_telemetry=False)
-        )
-        
-        self.collection_name = "enhanced_space_science_kb"
-        self.collection = None
+        if CHROMADB_AVAILABLE:
+            try:
+                print("Setting up ChromaDB...")
+                self.chroma_client = chromadb.PersistentClient(
+                    path=self.chroma_persist_dir,
+                    settings=Settings(anonymized_telemetry=False)
+                )
+                self.collection_name = "enhanced_space_science_kb"
+                self._initialize_vector_db()
+                print("✅ ChromaDB initialized")
+            except Exception as e:
+                print(f"⚠️  Could not initialize ChromaDB: {e}")
         
         # Load knowledge base
-        self.knowledge_base = self._load_knowledge_base(knowledge_base_path)
-        self._initialize_vector_db()
-        
-        print(f"Enhanced system initialized with {len(self.knowledge_base)} knowledge chunks.")
+        self.knowledge_base = self._load_knowledge_base(self.knowledge_base_path)
+        print(f"✅ System initialized with {len(self.knowledge_base)} knowledge chunks")
     
     def initialize(self):
-        """Initialize the assistant (for compatibility with main_assistant.py)."""
-        # This method is for compatibility - initialization is done in __init__
-        print("Enhanced assistant already initialized.")
+        """Compatibility method."""
+        print("Enhanced assistant initialization complete.")
         return True
     
-    def _initialize_openai(self, api_key: Optional[str]) -> openai.OpenAI:
+    def _initialize_openai(self, api_key: Optional[str]):
         """Initialize OpenAI client."""
+        if not OPENAI_AVAILABLE:
+            print("⚠️  OpenAI library not available")
+            return None
+            
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
         elif not os.getenv("OPENAI_API_KEY"):
-            print("⚠️  Warning: No OpenAI API key provided. Set OPENAI_API_KEY environment variable.")
-            print("   The assistant will work with basic response generation.")
+            print("⚠️  No OpenAI API key - basic mode only")
             return None
         
         try:
             client = openai.OpenAI()
-            # Test the connection
-            client.models.list()
+            client.models.list()  # Test connection
             print("✅ OpenAI GPT-4 connection established")
             return client
         except Exception as e:
-            print(f"❌ Error connecting to OpenAI: {e}")
+            print(f"⚠️  OpenAI connection failed: {e}")
             return None
     
     def _load_knowledge_base(self, file_path: str) -> List[Dict]:
         """Load knowledge base from JSON file."""
         try:
+            if not os.path.exists(file_path):
+                print(f"⚠️  Knowledge base file not found: {file_path}")
+                return []
+            
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 return data.get('knowledge_base', {}).get('chunks', [])
-        except FileNotFoundError:
-            print(f"⚠️  Knowledge base file not found: {file_path}")
-            print(f"   Creating empty knowledge base. You can add content later.")
-            return []
         except Exception as e:
-            print(f"❌ Error loading knowledge base: {e}")
+            print(f"⚠️  Error loading knowledge base: {e}")
             return []
     
     def _initialize_vector_db(self):
-        """Initialize ChromaDB collection with knowledge base."""
+        """Initialize ChromaDB collection."""
+        if not self.chroma_client:
+            return
+            
         try:
             # Try to get existing collection
             self.collection = self.chroma_client.get_collection(name=self.collection_name)
             print(f"Loaded existing collection with {self.collection.count()} documents")
         except:
             # Create new collection
-            print("Creating new enhanced collection...")
+            print("Creating new collection...")
             self.collection = self.chroma_client.create_collection(
                 name=self.collection_name,
-                metadata={"description": "Enhanced Space Science Knowledge Base with GPT-4"}
+                metadata={"description": "Enhanced Space Science KB"}
             )
-            if self.knowledge_base:
+            if self.knowledge_base and self.embedding_model:
                 self._populate_vector_db()
-            else:
-                print("⚠️  No knowledge base loaded. Collection created but empty.")
     
     def _populate_vector_db(self):
         """Populate ChromaDB with knowledge chunks."""
-        if not self.knowledge_base:
-            print("❌ No knowledge base to populate")
+        if not self.knowledge_base or not self.collection or not self.embedding_model:
             return
         
-        print(f"Populating vector database with {len(self.knowledge_base)} chunks...")
-        
-        documents = []
-        metadatas = []
-        ids = []
-        
-        for chunk in self.knowledge_base:
-            documents.append(chunk['text'])
-            ids.append(chunk['id'])
-            
-            # Prepare metadata (convert lists to strings for ChromaDB)
-            metadata = chunk['metadata'].copy()
-            for key, value in metadata.items():
-                if isinstance(value, list):
-                    metadata[key] = ', '.join(map(str, value))
-                elif not isinstance(value, (str, int, float, bool, type(None))):
-                    metadata[key] = str(value)
-            
-            metadatas.append(metadata)
-        
-        # Generate embeddings
-        embeddings = self.embedding_model.encode(documents).tolist()
-        
-        # Add to collection
-        self.collection.add(
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids,
-            embeddings=embeddings
-        )
-        
-        print(f"✅ Vector database populated with {len(documents)} chunks")
-    
-    def rebuild_knowledge_base(self, knowledge_base_path: str = "space_science_knowledge_base.json"):
-        """Rebuild the knowledge base by deleting and recreating the collection."""
         try:
-            # Delete existing collection
-            self.chroma_client.delete_collection(name=self.collection_name)
-            print("🔄 Deleted existing collection")
+            print(f"Populating vector database with {len(self.knowledge_base)} chunks...")
             
-            # Reload knowledge base
-            self.knowledge_base = self._load_knowledge_base(knowledge_base_path)
+            documents = []
+            metadatas = []
+            ids = []
             
-            # Create new collection
-            self.collection = self.chroma_client.create_collection(
-                name=self.collection_name,
-                metadata={"description": "Enhanced Space Science Knowledge Base with GPT-4"}
+            for chunk in self.knowledge_base:
+                documents.append(chunk['text'])
+                ids.append(chunk['id'])
+                
+                # Prepare metadata
+                metadata = chunk['metadata'].copy()
+                for key, value in metadata.items():
+                    if isinstance(value, list):
+                        metadata[key] = ', '.join(map(str, value))
+                    elif not isinstance(value, (str, int, float, bool, type(None))):
+                        metadata[key] = str(value)
+                
+                metadatas.append(metadata)
+            
+            # Generate embeddings
+            embeddings = self.embedding_model.encode(documents).tolist()
+            
+            # Add to collection
+            self.collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids,
+                embeddings=embeddings
             )
             
-            # Populate with updated data
-            self._populate_vector_db()
-            print(f"✅ Knowledge base rebuilt with {len(self.knowledge_base)} chunks")
-            
+            print(f"✅ Vector database populated with {len(documents)} chunks")
         except Exception as e:
-            print(f"❌ Error rebuilding knowledge base: {e}")
+            print(f"⚠️  Error populating vector DB: {e}")
     
     def retrieve_knowledge(self, query: str, n_results: int = 5) -> List[Dict]:
-        """Retrieve relevant knowledge chunks using semantic search."""
+        """Retrieve relevant knowledge chunks."""
+        if not self.collection or not self.embedding_model:
+            return []
+        
         try:
-            # Check if collection has any documents
             if self.collection.count() == 0:
-                print("⚠️  Knowledge base is empty")
                 return []
             
-            # Generate query embedding
             query_embedding = self.embedding_model.encode([query])[0].tolist()
             
-            # Search in ChromaDB
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=min(n_results, self.collection.count())
             )
             
-            # Format results
             chunks = []
             for i in range(len(results['ids'][0])):
                 chunks.append({
@@ -222,49 +238,28 @@ class EnhancedSpaceScienceAssistant:
                 })
             
             return chunks
-            
         except Exception as e:
-            print(f"Error retrieving knowledge: {e}")
+            print(f"⚠️  Error retrieving knowledge: {e}")
             return []
     
     def generate_gpt4_response(self, question: str, context_chunks: List[Dict]) -> Dict[str, Any]:
-        """Generate response using GPT-4 with retrieved context."""
-        
-        # Fallback if no OpenAI client
+        """Generate response using GPT-4."""
         if not self.openai_client:
             return self._generate_basic_response(question, context_chunks)
         
         try:
-            # Build context from chunks
+            # Build context
             context_text = ""
             for i, chunk in enumerate(context_chunks, 1):
                 context_text += f"\n--- Source {i} ---\n"
                 context_text += f"Topic: {chunk['metadata'].get('topic', 'Unknown')}\n"
                 context_text += f"Content: {chunk['text']}\n"
             
-            # Create system prompt
-            system_prompt = """You are an expert space science educator with deep knowledge of astronomy, 
-astrophysics, planetary science, and space exploration. Your responses should be:
-
-1. Based primarily on the provided context sources
-2. If the context doesn't fully answer the question, acknowledge this
-3. Provide specific details and examples when available
-4. Maintain scientific accuracy
-5. Be engaging and educational
-6. Always cite which sources you're using (Source 1, Source 2, etc.)
-"""
+            system_prompt = """You are an expert space science educator. Provide accurate, 
+engaging answers based on the provided context. Always cite your sources."""
             
-            # Create user prompt
-            user_prompt = f"""
-Context Information:
-{context_text}
-
-Question: {question}
-
-Please provide a comprehensive answer based on the context above.
-"""
+            user_prompt = f"""Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"""
             
-            # Call GPT-4
             response = self.openai_client.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -277,71 +272,56 @@ Please provide a comprehensive answer based on the context above.
             
             gpt_response = response.choices[0].message.content
             
-            # Extract topics and sources
-            topics_covered = list(set([
-                chunk['metadata'].get('topic', 'Unknown')
-                for chunk in context_chunks
-            ]))
-            
+            topics = list(set([chunk['metadata'].get('topic', 'Unknown') for chunk in context_chunks]))
             sources = [{
                 'topic': chunk['metadata'].get('topic', 'Unknown'),
-                'subtopic': chunk['metadata'].get('subtopic', 'Unknown'),
-                'year': chunk['metadata'].get('year', 'Unknown'),
-                'source_url': chunk['metadata'].get('source', 'Unknown')
+                'subtopic': chunk['metadata'].get('subtopic', 'Unknown')
             } for chunk in context_chunks]
             
             return {
                 'response': gpt_response,
                 'sources': sources,
-                'topics': topics_covered,
-                'model_used': 'GPT-4',
-                'chunks_used': len(context_chunks)
+                'topics': topics,
+                'model_used': 'GPT-4'
             }
-            
         except Exception as e:
-            print(f"Error with GPT-4 generation: {e}")
+            print(f"⚠️  GPT-4 error: {e}")
             return self._generate_basic_response(question, context_chunks)
     
     def _generate_basic_response(self, question: str, context_chunks: List[Dict]) -> Dict[str, Any]:
-        """Fallback response generation without GPT-4."""
+        """Fallback response without GPT-4."""
         if not context_chunks:
             return {
-                'response': "I don't have enough information to answer that question. Please try rephrasing or asking about a different space science topic.",
+                'response': "I don't have enough information to answer that question.",
                 'sources': [],
                 'topics': [],
-                'model_used': 'Basic',
-                'chunks_used': 0
+                'model_used': 'Basic'
             }
         
-        # Simple response combining top chunks
         response_parts = []
-        topics_covered = set()
+        topics = set()
         
-        for i, chunk in enumerate(context_chunks[:3]):
+        for i, chunk in enumerate(context_chunks[:3], 1):
             topic = chunk['metadata'].get('topic', 'Space Science')
-            topics_covered.add(topic)
-            response_parts.append(f"• {chunk['text']}")
+            topics.add(topic)
+            response_parts.append(f"{i}. {chunk['text'][:200]}...")
         
-        response = f"Based on current space science knowledge:\n\n" + "\n\n".join(response_parts)
+        response = f"Based on space science knowledge:\n\n" + "\n\n".join(response_parts)
         
         sources = [{
             'topic': chunk['metadata'].get('topic', 'Unknown'),
-            'subtopic': chunk['metadata'].get('subtopic', 'Unknown'),
-            'year': chunk['metadata'].get('year', 'Unknown'),
-            'source_url': chunk['metadata'].get('source', 'Unknown')
+            'subtopic': chunk['metadata'].get('subtopic', 'Unknown')
         } for chunk in context_chunks]
         
         return {
             'response': response,
             'sources': sources,
-            'topics': list(topics_covered),
-            'model_used': 'Basic',
-            'chunks_used': len(context_chunks)
+            'topics': list(topics),
+            'model_used': 'Basic'
         }
     
     def ask(self, question: str) -> Dict[str, Any]:
-        """Ask a question and get an enhanced GPT-4 response."""
-        # Add to conversation history
+        """Ask a question."""
         self.conversation_history.append({
             'type': 'user',
             'content': question,
@@ -351,33 +331,34 @@ Please provide a comprehensive answer based on the context above.
         # Optimize query
         optimized_query = self.query_optimizer.optimize_query(question)
         
-        # Retrieve relevant knowledge
+        # Retrieve knowledge
         relevant_chunks = self.retrieve_knowledge(optimized_query['optimized_query'])
         
-        # Generate enhanced response
+        # Generate response
         response_data = self.generate_gpt4_response(question, relevant_chunks)
         
-        # Add to conversation history
+        # Add to history
         self.conversation_history.append({
             'type': 'assistant',
             'content': response_data['response'],
-            'timestamp': datetime.now().isoformat(),
-            'sources': response_data['sources'],
-            'model_used': response_data['model_used']
+            'timestamp': datetime.now().isoformat()
         })
         
         return response_data
     
     def ask_question(self, question: str) -> Dict[str, Any]:
-        """Compatibility method for main_assistant.py - calls ask method."""
+        """Compatibility method."""
         return self.ask(question)
     
     def get_available_topics(self) -> List[str]:
-        """Get list of available topics."""
+        """Get available topics."""
+        if not self.collection:
+            return []
+        
         try:
             if self.collection.count() == 0:
                 return []
-                
+            
             results = self.collection.get()
             topics = set()
             for metadata in results['metadatas']:
@@ -385,28 +366,7 @@ Please provide a comprehensive answer based on the context above.
                     topics.add(metadata['topic'])
             return sorted(list(topics))
         except Exception as e:
-            print(f"Error getting topics: {e}")
-            return []
-    
-    def search_by_topic(self, topic: str, limit: int = 5) -> List[Dict]:
-        """Search for chunks by specific topic."""
-        try:
-            results = self.collection.get(
-                where={"topic": {"$eq": topic}},
-                limit=limit
-            )
-            
-            chunks = []
-            for i in range(len(results['ids'])):
-                chunks.append({
-                    'id': results['ids'][i],
-                    'text': results['documents'][i],
-                    'metadata': results['metadatas'][i]
-                })
-            
-            return chunks
-        except Exception as e:
-            print(f"Error searching by topic: {e}")
+            print(f"⚠️  Error getting topics: {e}")
             return []
     
     def get_conversation_history(self) -> List[Dict]:
@@ -416,3 +376,25 @@ Please provide a comprehensive answer based on the context above.
     def clear_conversation_history(self):
         """Clear conversation history."""
         self.conversation_history = []
+    
+    def rebuild_knowledge_base(self, knowledge_base_path: str = "space_science_knowledge_base.json"):
+        """Rebuild knowledge base."""
+        if not self.chroma_client:
+            print("⚠️  ChromaDB not available")
+            return
+        
+        try:
+            self.chroma_client.delete_collection(name=self.collection_name)
+            print("🔄 Deleted existing collection")
+            
+            self.knowledge_base = self._load_knowledge_base(knowledge_base_path)
+            
+            self.collection = self.chroma_client.create_collection(
+                name=self.collection_name,
+                metadata={"description": "Enhanced Space Science KB"}
+            )
+            
+            self._populate_vector_db()
+            print(f"✅ Knowledge base rebuilt with {len(self.knowledge_base)} chunks")
+        except Exception as e:
+            print(f"❌ Error rebuilding knowledge base: {e}")
